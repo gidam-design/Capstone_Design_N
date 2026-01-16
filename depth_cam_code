@@ -1,0 +1,172 @@
+import pyrealsense2 as rs
+import numpy as np
+import cv2
+
+def main():
+    pipeline = rs.pipeline()
+    config = rs.config()
+
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+
+    try:
+        profile = pipeline.start(config)
+    except RuntimeError as e:
+        print(f"❌ 카메라 연결 오류: {e}")
+        print("해결 방법:")
+        print("1. RealSense 카메라가 USB로 연결되어 있는지 확인하세요")
+        print("2. USB 케이블을 다시 꽂아보세요")
+        print("3. 다른 USB 포트에 연결해보세요")
+        print("4. 카메라 드라이버를 재설치하세요")
+        return
+
+    depth_sensor = profile.get_device().first_depth_sensor()
+    depth_scale = depth_sensor.get_depth_scale()
+    print("Depth scale:", depth_scale)
+
+    align = rs.align(rs.stream.color)
+
+    spatial = rs.spatial_filter()
+    temporal = rs.temporal_filter()
+
+    # ====== 튜닝 파라미터 ======
+    Z_MIN = 0.15
+    Z_MAX = 0.40
+
+    # ✅ 평평한 테이블 제거용(깊이 변화량 임계값, mm 단위 느낌)
+    GRAD_THR = 1.5   # 치킨이 너무 사라지면 1.0~1.5로 낮추고, 테이블이 남으면 3~5로 올려
+
+    MIN_AREA = 1000
+    MIN_H = 25
+    MAX_ASPECT = 6.0
+    ZSTD_MIN = 0.003
+
+    # ROI 비율(집게 사이만 보기)
+    ROI_X1, ROI_X2 = 0.35, 0.75
+    ROI_Y1, ROI_Y2 = 0.30, 0.80
+
+    try:
+        while True:
+            frames = pipeline.wait_for_frames()
+            frames = align.process(frames)
+
+            depth_frame = frames.get_depth_frame()
+            color_frame = frames.get_color_frame()
+            if not depth_frame or not color_frame:
+                continue
+
+            depth_frame = spatial.process(depth_frame)
+            depth_frame = temporal.process(depth_frame)
+
+            depth = np.asanyarray(depth_frame.get_data())
+            color = np.asanyarray(color_frame.get_data())
+
+            depth_m = depth.astype(np.float32) * depth_scale
+
+            # 1) 거리 범위 마스크 (valid depth 포함)
+            valid = depth_m > 0
+            mask = valid & (depth_m > Z_MIN) & (depth_m < Z_MAX)
+            mask = mask.astype(np.uint8) * 255
+
+            # 2) ✅ 깊이 변화량(gradient)로 평평한 영역(테이블) 제거
+            depth_mm = (depth_m * 1000.0).astype(np.float32)
+            gx = cv2.Sobel(depth_mm, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(depth_mm, cv2.CV_32F, 0, 1, ksize=3)
+            grad = cv2.magnitude(gx, gy)
+            edge_mask = (grad > GRAD_THR).astype(np.uint8) * 255
+
+            mask = cv2.bitwise_and(mask, edge_mask)
+
+            # 3) ROI 마스크로 "집게 사이"만 남기기
+            H, W = mask.shape
+            x1, x2 = int(W * ROI_X1), int(W * ROI_X2)
+            y1, y2 = int(H * ROI_Y1), int(H * ROI_Y2)
+
+            roi_gate = np.zeros_like(mask)
+            roi_gate[y1:y2, x1:x2] = 255
+            mask = cv2.bitwise_and(mask, roi_gate)
+
+            # 4) ✅ 마스크 후처리 (치킨만 남기기)
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
+            # 작은 점 제거
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+            # 구멍 메우기
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+
+            # 얇게 연결된 부분 끊기 (치킨+집게 붙는거 끊는 핵심)
+            mask = cv2.erode(mask, k, iterations=2)
+            mask = cv2.dilate(mask, k, iterations=2)
+
+            # ====== 여기부터는 기존 “선택/박스” 로직 (유지) ======
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            vis = color.copy()
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 255, 0), 2)
+
+            cx0, cy0 = (x1 + x2) // 2, (y1 + y2) // 2
+            best_rect = None
+            best_score = 1e18
+            best_zstd = 0.0
+
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < MIN_AREA:
+                    continue
+
+                x, y, w, h = cv2.boundingRect(c)
+
+                if h < MIN_H:
+                    continue
+                aspect = w / (h + 1e-6)
+                if aspect > MAX_ASPECT:
+                    continue
+
+                roi_depth = depth_m[y:y+h, x:x+w]
+                roi_mask = mask[y:y+h, x:x+w] > 0
+                if not np.any(roi_mask):
+                    continue
+
+                z_std = float(np.std(roi_depth[roi_mask]))
+                if z_std < ZSTD_MIN:
+                    continue
+
+                cx, cy = x + w // 2, y + h // 2
+                center_dist2 = (cx - cx0) ** 2 + (cy - cy0) ** 2
+
+                score = center_dist2 - 3e7 * z_std
+
+                if score < best_score:
+                    best_score = score
+                    best_rect = (x, y, w, h)
+                    best_zstd = z_std
+
+            if best_rect is not None:
+                x, y, w, h = best_rect
+                cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+                roi_depth = depth_m[y:y+h, x:x+w]
+                roi_mask = mask[y:y+h, x:x+w] > 0
+                if np.any(roi_mask):
+                    z_mean = float(np.mean(roi_depth[roi_mask]))
+                    cv2.putText(vis, f"z_mean={z_mean:.3f}m z_std={best_zstd:.3f}m",
+                                (x, max(0, y - 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            depth_vis = cv2.convertScaleAbs(depth_m, alpha=255.0 / 1.0)
+            depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+
+            cv2.imshow("color+box", vis)
+            cv2.imshow("mask", mask)
+            cv2.imshow("depth_vis", depth_vis)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27 or key == ord('q'):
+                break
+
+    finally:
+        pipeline.stop()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
