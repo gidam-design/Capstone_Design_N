@@ -1,0 +1,286 @@
+import time
+import msvcrt
+import serial
+from dynamixel_sdk import PortHandler, PacketHandler, COMM_SUCCESS
+
+# =========================
+# 버튼(OpenRB) 시리얼
+# =========================
+BTN_PORT = "COM36"      # OpenRB 포트
+BTN_BAUD = 115200
+BTN_TIMEOUT = 0.01      # 루프 안 막히게
+
+DOUBLE_MS = 0.35        # BTN2 더블클릭 판정 시간(초) 0.25~0.5 추천
+
+# =========================
+# 공통 설정 (Dynamixel)
+# =========================
+PORT_NAME = "COM35"
+BAUDRATE = 57600
+PROTOCOL_VERSION = 2.0
+
+ID1 = 1
+ID2 = 2
+
+# =========================
+# XM430 Control Table (Protocol 2.0)
+# =========================
+ADDR_TORQUE_ENABLE      = 64
+ADDR_OPERATING_MODE     = 11
+ADDR_GOAL_POSITION      = 116
+ADDR_PRESENT_POSITION   = 132
+ADDR_GOAL_CURRENT       = 102
+ADDR_PRESENT_CURRENT    = 126
+
+TORQUE_ENABLE  = 1
+TORQUE_DISABLE = 0
+
+POSITION_MODE = 3
+CURRENT_MODE  = 0
+
+TICKS_PER_REV = 4096
+
+# =========================
+# ID1 (그리퍼)
+# =========================
+ID1_START_POS = 2900
+
+CLOSE_CURRENT = 120
+CONTACT_CURRENT_TH = 90
+HOLD_CURRENT = 70
+CONTACT_DEBOUNCE_COUNT = 4
+
+ID1_MOVE_TIMEOUT_SEC = 3.0
+ID1_POS_TOL = 30
+
+# =========================
+# ID2 (회전)
+# =========================
+ID2_START_POS = 3485
+PLUS_DIR = -1
+
+DELTA_180 = 2082
+DELTA_90  = 1041
+
+ID2_MOVE_TIMEOUT_SEC = 4.0
+ID2_POS_TOL = 30
+
+PRINT_DT = 0.25
+
+# =========================
+# 유틸
+# =========================
+def dxl_comm_result_str(packet_handler, result):
+    return packet_handler.getTxRxResult(result)
+
+def dxl_error_str(packet_handler, error):
+    return packet_handler.getRxPacketError(error)
+
+def _u(r): return r[:2] if len(r)==2 else r[1:3]
+def write1(ph, port, dxl_id, addr, val): return _u(ph.write1ByteTxRx(port, dxl_id, addr, val))
+def write2(ph, port, dxl_id, addr, val): return _u(ph.write2ByteTxRx(port, dxl_id, addr, val))
+def write4(ph, port, dxl_id, addr, val): return _u(ph.write4ByteTxRx(port, dxl_id, addr, val))
+
+def safe_check(ph, r, e, m):
+    if r != COMM_SUCCESS: raise RuntimeError(f"[FAIL] {m} comm: {dxl_comm_result_str(ph, r)}")
+    if e != 0: raise RuntimeError(f"[FAIL] {m} packet: {dxl_error_str(ph, e)}")
+def wrap_0_4095(x): return int(x) % TICKS_PER_REV
+def to_signed_16(x): return x - 65536 if x > 32767 else x
+
+def read_pos_try(ph, port, dxl_id, retry=1):
+    for _ in range(retry + 1):
+        pos, r, e = ph.read4ByteTxRx(port, dxl_id, ADDR_PRESENT_POSITION)
+        if r == COMM_SUCCESS and e == 0: return int(pos)
+        time.sleep(0.005)
+    return None
+
+def read_cur_strict(ph, port, dxl_id):
+    cur, r, e = ph.read2ByteTxRx(port, dxl_id, ADDR_PRESENT_CURRENT)
+    safe_check(ph, r, e, f"read present current (ID={dxl_id})")
+    return to_signed_16(cur)
+
+def set_mode(ph, port, dxl_id, mode):
+    r, e = write1(ph, port, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+    safe_check(ph, r, e, f"torque off (mode change) ID={dxl_id}")
+    r, e = write1(ph, port, dxl_id, ADDR_OPERATING_MODE, mode)
+    safe_check(ph, r, e, f"set operating mode={mode} ID={dxl_id}")
+    r, e = write1(ph, port, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+    safe_check(ph, r, e, f"torque on (after mode change) ID={dxl_id}")
+
+def move_to_position(ph, port, dxl_id, goal_pos, tol=30, timeout=3.0, wrap_goal=False):
+    if wrap_goal: goal_pos = wrap_0_4095(goal_pos)
+    r, e = write4(ph, port, dxl_id, ADDR_GOAL_POSITION, int(goal_pos))
+    safe_check(ph, r, e, f"write goal position ID={dxl_id}")
+    t0 = time.time()
+    while True:
+        pos = read_pos_try(ph, port, dxl_id, retry=1)
+        if pos is None:
+            if time.time() - t0 > timeout: return False, None, None
+            time.sleep(0.02); continue
+        err = abs(pos - goal_pos)
+        if err <= tol: return True, pos, err
+        if time.time() - t0 > timeout: return False, pos, err
+        time.sleep(0.04)
+
+# =========================
+# 메인
+# =========================
+def main():
+    port = PortHandler(PORT_NAME)
+    ph = PacketHandler(PROTOCOL_VERSION)
+    btn_ser = None
+    if not port.openPort(): raise RuntimeError(f"[FAIL] 포트를 열 수 없음: {PORT_NAME}")
+    print(f"[OK] Port open: {PORT_NAME}")
+    if not port.setBaudRate(BAUDRATE): raise RuntimeError(f"[FAIL] 보드레이트 설정 실패: {BAUDRATE}")
+    print(f"[OK] Baudrate set: {BAUDRATE}")
+    for dxl_id in (ID1, ID2):
+        model, r, e = ph.ping(port, dxl_id)
+        safe_check(ph, r, e, f"ping ID={dxl_id}")
+        print(f"[OK] Found ID={dxl_id}, Model={model}")
+
+    try:
+        btn_ser = serial.Serial(BTN_PORT, BTN_BAUD, timeout=BTN_TIMEOUT)
+        print(f"[OK] Button serial open: {BTN_PORT} @ {BTN_BAUD}")
+        print(f"\n[INIT] ID1 go START_POS={ID1_START_POS}")
+        set_mode(ph, port, ID1, POSITION_MODE)
+        ok, pos, err = move_to_position(ph, port, ID1, ID1_START_POS, tol=ID1_POS_TOL, timeout=ID1_MOVE_TIMEOUT_SEC)
+        print(f"       {'OK' if ok else 'WARN'} pos={pos} err={err}")
+        print(f"\n[INIT] ID2 go START_POS={ID2_START_POS}")
+        set_mode(ph, port, ID2, POSITION_MODE)
+        ok, pos, err = move_to_position(ph, port, ID2, ID2_START_POS, tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+        print(f"       {'OK' if ok else 'WARN'} pos={pos} err={err}")
+        id1_state = "RELEASED"
+        id1_contacted = False
+        id1_contact_cnt = 0
+        id2_state = "HOME"
+        btn2_pending = False
+        btn2_t0 = 0.0
+        print("\n[READY]")
+        print("  BTN1(버튼1)  : ID1 GRIP <-> RETURN_TO_START (키보드 '1')")
+        print("  BTN2(버튼2)  : ID2 180deg toggle <-> RETURN_TO_START (키보드 '2')")
+        print("  BTN2 더블클릭: ID2  90deg toggle <-> RETURN_TO_START (키보드 '3')")
+        print("  'q' : quit\n")
+        next_print = time.time()
+
+        # 공통 액션 처리 함수
+        def handle_action(key: bytes) -> bool:
+            nonlocal id1_state, id1_contacted, id1_contact_cnt, id2_state
+
+            if key == b'1':
+                if id1_state == "RELEASED":
+                    id1_state = "GRIPPING"
+                    id1_contacted = False
+                    id1_contact_cnt = 0
+
+                    set_mode(ph, port, ID1, CURRENT_MODE)
+                    r, e = write2(ph, port, ID1, ADDR_GOAL_CURRENT, CLOSE_CURRENT)
+                    safe_check(ph, r, e, f"ID1 set CLOSE_CURRENT={CLOSE_CURRENT}")
+                    print(f"[ID1] -> GRIP ON | close current={CLOSE_CURRENT}")
+                else:
+                    id1_state = "RELEASED"
+                    id1_contacted = False
+                    id1_contact_cnt = 0
+
+                    set_mode(ph, port, ID1, CURRENT_MODE)
+                    r, e = write2(ph, port, ID1, ADDR_GOAL_CURRENT, 0)
+                    safe_check(ph, r, e, "ID1 goal current=0 (release)")
+                    print("[ID1] -> RELEASE | goal current=0")
+
+                    set_mode(ph, port, ID1, POSITION_MODE)
+                    ok, pos, err = move_to_position(ph, port, ID1, ID1_START_POS, tol=ID1_POS_TOL, timeout=ID1_MOVE_TIMEOUT_SEC)
+                    print(f"[ID1] RETURN {'OK' if ok else 'WARN'} pos={pos} err={err}")
+
+            elif key == b'2':
+                set_mode(ph, port, ID2, POSITION_MODE)
+
+                if id2_state != "ROT180":
+                    goal = ID2_START_POS + PLUS_DIR * DELTA_180
+                    ok, pos, err = move_to_position(ph, port, ID2, goal, tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+                    print(f"[ID2] -> ROT180 | goal={wrap_0_4095(goal)} | {'OK' if ok else 'WARN'} pos={pos} err={err}")
+                    id2_state = "ROT180"
+                else:
+                    ok, pos, err = move_to_position(ph, port, ID2, ID2_START_POS, tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+                    print(f"[ID2] -> HOME | goal={wrap_0_4095(ID2_START_POS)} | {'OK' if ok else 'WARN'} pos={pos} err={err}")
+                    id2_state = "HOME"
+
+            elif key == b'3':
+                set_mode(ph, port, ID2, POSITION_MODE)
+
+                if id2_state != "ROT90":
+                    goal = ID2_START_POS + PLUS_DIR * DELTA_90
+                    ok, pos, err = move_to_position(ph, port, ID2, goal, tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+                    print(f"[ID2] -> ROT90  | goal={wrap_0_4095(goal)} | {'OK' if ok else 'WARN'} pos={pos} err={err}")
+                    id2_state = "ROT90"
+                else:
+                    ok, pos, err = move_to_position(ph, port, ID2, ID2_START_POS, tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+                    print(f"[ID2] -> HOME  | goal={wrap_0_4095(ID2_START_POS)} | {'OK' if ok else 'WARN'} pos={pos} err={err}")
+                    id2_state = "HOME"
+
+            elif key in (b'q', b'Q'):
+                print("[QUIT] requested")
+                return False
+
+            return True
+
+        while True:
+            # ---- (A) 버튼 입력 ----
+            line = btn_ser.readline().decode(errors="ignore").strip()
+            now_t = time.time()
+            if line == "BTN1":
+                if not handle_action(b'1'): break
+            elif line == "BTN2":
+                if not btn2_pending:
+                    btn2_pending = True
+                    btn2_t0 = now_t
+                else:
+                    if (now_t - btn2_t0) <= DOUBLE_MS:
+                        btn2_pending = False
+                        if not handle_action(b'3'): break
+                    else:
+                        btn2_t0 = now_t
+                        btn2_pending = True
+            if btn2_pending and (now_t - btn2_t0) > DOUBLE_MS:
+                btn2_pending = False
+                if not handle_action(b'2'): break
+            if msvcrt.kbhit():
+                key = msvcrt.getch()
+                if key not in (b'\x00', b'\xe0'):
+                    if not handle_action(key): break
+                else:
+                    _ = msvcrt.getch()
+
+            if id1_state == "GRIPPING" and (not id1_contacted):
+                cur = abs(read_cur_strict(ph, port, ID1))
+                if cur >= CONTACT_CURRENT_TH: id1_contact_cnt += 1
+                else: id1_contact_cnt = 0
+                if id1_contact_cnt >= CONTACT_DEBOUNCE_COUNT:
+                    id1_contacted = True
+                    r, e = write2(ph, port, ID1, ADDR_GOAL_CURRENT, HOLD_CURRENT)
+                    safe_check(ph, r, e, f"ID1 set HOLD_CURRENT={HOLD_CURRENT}")
+                    print(f"[ID1] CONTACT -> HOLD_CURRENT={HOLD_CURRENT}")
+
+            now = time.time()
+            if now >= next_print:
+                p1 = read_pos_try(ph, port, ID1, retry=0)
+                p2 = read_pos_try(ph, port, ID2, retry=0)
+                cur1 = None
+                if p1 is not None:
+                    try: cur1 = read_cur_strict(ph, port, ID1)
+                    except: cur1 = None
+                print(f"  ID1: state={id1_state:9s} pos={p1} cur={cur1} contacted={id1_contacted} | ID2: state={id2_state:5s} pos={p2}")
+                next_print = now + PRINT_DT
+            time.sleep(0.01)
+
+    finally:
+        try: write2(ph, port, ID1, ADDR_GOAL_CURRENT, 0); write1(ph, port, ID1, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+        except: pass
+        try: write1(ph, port, ID2, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+        except: pass
+        try:
+            if btn_ser is not None and btn_ser.is_open: btn_ser.close()
+        except: pass
+        port.closePort()
+        print("\n[END] Torque OFF & close port")
+
+if __name__ == "__main__":
+    main()
