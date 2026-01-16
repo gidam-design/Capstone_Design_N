@@ -1,0 +1,330 @@
+import time
+import msvcrt
+from dynamixel_sdk import PortHandler, PacketHandler, COMM_SUCCESS
+
+# =========================
+# 공통 설정
+# =========================
+PORT_NAME = "COM35"
+BAUDRATE = 57600
+PROTOCOL_VERSION = 2.0
+
+ID1 = 1
+ID2 = 2
+
+# =========================
+# XM430 Control Table (Protocol 2.0)
+# =========================
+ADDR_TORQUE_ENABLE      = 64
+ADDR_OPERATING_MODE     = 11
+ADDR_GOAL_POSITION      = 116
+ADDR_PRESENT_POSITION   = 132
+ADDR_GOAL_CURRENT       = 102
+ADDR_PRESENT_CURRENT    = 126
+
+TORQUE_ENABLE  = 1
+TORQUE_DISABLE = 0
+
+POSITION_MODE = 3
+CURRENT_MODE  = 0
+
+TICKS_PER_REV = 4096
+
+# =========================
+# ID1 (그리퍼)
+# =========================
+ID1_START_POS = 2900
+
+CLOSE_CURRENT = 120
+CONTACT_CURRENT_TH = 90
+HOLD_CURRENT = 70
+CONTACT_DEBOUNCE_COUNT = 4
+
+ID1_MOVE_TIMEOUT_SEC = 3.0
+ID1_POS_TOL = 30
+
+# =========================
+# ID2 (회전)
+# =========================
+ID2_START_POS = 3485
+PLUS_DIR = -1          # 너의 +방향 정의 그대로
+
+DELTA_180 = 2082       # (180+보정) tick
+DELTA_90  = 1041       # 네가 쓰는 90도(보정 포함) tick
+
+ID2_MOVE_TIMEOUT_SEC = 4.0
+ID2_POS_TOL = 30
+
+PRINT_DT = 0.25
+
+# =========================
+# 유틸
+# =========================
+def dxl_comm_result_str(packet_handler, result):
+    return packet_handler.getTxRxResult(result)
+
+def dxl_error_str(packet_handler, error):
+    return packet_handler.getRxPacketError(error)
+
+def unpack_write(ret):
+    if isinstance(ret, tuple):
+        if len(ret) == 2:
+            return ret[0], ret[1]
+        if len(ret) == 3:
+            return ret[1], ret[2]
+    raise ValueError(f"Unexpected return from SDK write: {ret}")
+
+def write1(ph, port, dxl_id, addr, value):
+    result, error = unpack_write(ph.write1ByteTxRx(port, dxl_id, addr, value))
+    return result, error
+
+def write2(ph, port, dxl_id, addr, value):
+    result, error = unpack_write(ph.write2ByteTxRx(port, dxl_id, addr, value))
+    return result, error
+
+def write4(ph, port, dxl_id, addr, value):
+    result, error = unpack_write(ph.write4ByteTxRx(port, dxl_id, addr, value))
+    return result, error
+
+def safe_check(ph, result, error, msg):
+    if result != COMM_SUCCESS:
+        raise RuntimeError(f"[FAIL] {msg} comm: {dxl_comm_result_str(ph, result)}")
+    if error != 0:
+        raise RuntimeError(f"[FAIL] {msg} packet: {dxl_error_str(ph, error)}")
+
+def wrap_0_4095(x):
+    return int(x) % TICKS_PER_REV
+
+def to_signed_16(x):
+    if x > 32767:
+        x -= 65536
+    return x
+
+def read_pos_try(ph, port, dxl_id, retry=1):
+    """통신 튀면 None (프로그램 안 죽게)"""
+    for _ in range(retry + 1):
+        pos, r, e = ph.read4ByteTxRx(port, dxl_id, ADDR_PRESENT_POSITION)
+        if r == COMM_SUCCESS and e == 0:
+            return int(pos)
+        time.sleep(0.005)
+    return None
+
+def read_cur_strict(ph, port, dxl_id):
+    cur, r, e = ph.read2ByteTxRx(port, dxl_id, ADDR_PRESENT_CURRENT)
+    safe_check(ph, r, e, f"read present current (ID={dxl_id})")
+    return to_signed_16(cur)
+
+def set_mode(ph, port, dxl_id, mode):
+    # 모드 변경은 Torque OFF에서
+    r, e = write1(ph, port, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+    safe_check(ph, r, e, f"torque off (mode change) ID={dxl_id}")
+    r, e = write1(ph, port, dxl_id, ADDR_OPERATING_MODE, mode)
+    safe_check(ph, r, e, f"set operating mode={mode} ID={dxl_id}")
+    r, e = write1(ph, port, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+    safe_check(ph, r, e, f"torque on (after mode change) ID={dxl_id}")
+
+def move_to_position(ph, port, dxl_id, goal_pos, tol=30, timeout=3.0, wrap_goal=False):
+    if wrap_goal:
+        goal_pos = wrap_0_4095(goal_pos)
+
+    r, e = write4(ph, port, dxl_id, ADDR_GOAL_POSITION, int(goal_pos))
+    safe_check(ph, r, e, f"write goal position ID={dxl_id}")
+
+    t0 = time.time()
+    while True:
+        pos = read_pos_try(ph, port, dxl_id, retry=1)
+        if pos is None:
+            if time.time() - t0 > timeout:
+                return False, None, None
+            time.sleep(0.02)
+            continue
+
+        err = abs(pos - goal_pos)
+        if err <= tol:
+            return True, pos, err
+        if time.time() - t0 > timeout:
+            return False, pos, err
+        time.sleep(0.04)
+
+# =========================
+# 메인
+# =========================
+def main():
+    port = PortHandler(PORT_NAME)
+    ph = PacketHandler(PROTOCOL_VERSION)
+
+    if not port.openPort():
+        raise RuntimeError(f"[FAIL] 포트를 열 수 없음: {PORT_NAME}")
+    print(f"[OK] Port open: {PORT_NAME}")
+
+    if not port.setBaudRate(BAUDRATE):
+        raise RuntimeError(f"[FAIL] 보드레이트 설정 실패: {BAUDRATE}")
+    print(f"[OK] Baudrate set: {BAUDRATE}")
+
+    # Ping
+    for dxl_id in (ID1, ID2):
+        model, r, e = ph.ping(port, dxl_id)
+        safe_check(ph, r, e, f"ping ID={dxl_id}")
+        print(f"[OK] Found ID={dxl_id}, Model={model}")
+
+    # -------------------------
+    # 초기화
+    # -------------------------
+    try:
+        # ID1 init
+        print(f"\n[INIT] ID1 go START_POS={ID1_START_POS}")
+        set_mode(ph, port, ID1, POSITION_MODE)
+        ok, pos, err = move_to_position(ph, port, ID1, ID1_START_POS, tol=ID1_POS_TOL, timeout=ID1_MOVE_TIMEOUT_SEC)
+        print(f"       {'OK' if ok else 'WARN'} pos={pos} err={err}")
+
+        # ID2 init
+        print(f"\n[INIT] ID2 go START_POS={ID2_START_POS}")
+        set_mode(ph, port, ID2, POSITION_MODE)
+        ok, pos, err = move_to_position(ph, port, ID2, ID2_START_POS, tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+        print(f"       {'OK' if ok else 'WARN'} pos={pos} err={err}")
+
+        # 상태변수
+        id1_state = "RELEASED"    # RELEASED / GRIPPING
+        id1_contacted = False
+        id1_contact_cnt = 0
+
+        id2_state = "HOME"        # HOME / ROT90 / ROT180
+
+        print("\n[READY]")
+        print("  '1' : ID1 GRIP <-> RETURN_TO_START")
+        print("  '2' : ID2 180deg toggle <-> RETURN_TO_START")
+        print("  '3' : ID2 90deg  toggle <-> RETURN_TO_START")
+        print("  'q' : quit\n")
+
+        next_print = time.time()
+
+        while True:
+            # ---- 키 입력 ----
+            if msvcrt.kbhit():
+                key = msvcrt.getch()
+                if key in (b'\x00', b'\xe0'):
+                    _ = msvcrt.getch()
+                    continue
+
+                # =========================
+                # ID1: 그리퍼 토크 토글
+                # =========================
+                if key == b'1':
+                    if id1_state == "RELEASED":
+                        id1_state = "GRIPPING"
+                        id1_contacted = False
+                        id1_contact_cnt = 0
+
+                        set_mode(ph, port, ID1, CURRENT_MODE)
+                        r, e = write2(ph, port, ID1, ADDR_GOAL_CURRENT, CLOSE_CURRENT)
+                        safe_check(ph, r, e, f"ID1 set CLOSE_CURRENT={CLOSE_CURRENT}")
+                        print(f"[ID1] -> GRIP ON | close current={CLOSE_CURRENT}")
+
+                    else:
+                        id1_state = "RELEASED"
+                        id1_contacted = False
+                        id1_contact_cnt = 0
+
+                        set_mode(ph, port, ID1, CURRENT_MODE)
+                        r, e = write2(ph, port, ID1, ADDR_GOAL_CURRENT, 0)
+                        safe_check(ph, r, e, "ID1 goal current=0 (release)")
+                        print("[ID1] -> RELEASE | goal current=0")
+
+                        set_mode(ph, port, ID1, POSITION_MODE)
+                        ok, pos, err = move_to_position(ph, port, ID1, ID1_START_POS, tol=ID1_POS_TOL, timeout=ID1_MOVE_TIMEOUT_SEC)
+                        print(f"[ID1] RETURN {'OK' if ok else 'WARN'} pos={pos} err={err}")
+
+                # =========================
+                # ID2: 180도 토글 (키 '2')
+                # =========================
+                elif key == b'2':
+                    # 항상 Position Mode에서 움직이게
+                    set_mode(ph, port, ID2, POSITION_MODE)
+
+                    if id2_state != "ROT180":
+                        # 다른 상태(ROT90 포함)면 목표를 ROT180으로
+                        goal = ID2_START_POS + PLUS_DIR * DELTA_180
+                        ok, pos, err = move_to_position(ph, port, ID2, goal, tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+                        print(f"[ID2] -> ROT180 | goal={wrap_0_4095(goal)} | {'OK' if ok else 'WARN'} pos={pos} err={err}")
+                        id2_state = "ROT180"
+                    else:
+                        # ROT180 상태면 HOME 복귀
+                        ok, pos, err = move_to_position(ph, port, ID2, ID2_START_POS, tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+                        print(f"[ID2] -> HOME | goal={wrap_0_4095(ID2_START_POS)} | {'OK' if ok else 'WARN'} pos={pos} err={err}")
+                        id2_state = "HOME"
+
+                # =========================
+                # ID2: 90도 토글 (키 '3')
+                # =========================
+                elif key == b'3':
+                    set_mode(ph, port, ID2, POSITION_MODE)
+
+                    if id2_state != "ROT90":
+                        goal = ID2_START_POS + PLUS_DIR * DELTA_90
+                        ok, pos, err = move_to_position(ph, port, ID2, goal, tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+                        print(f"[ID2] -> ROT90  | goal={wrap_0_4095(goal)} | {'OK' if ok else 'WARN'} pos={pos} err={err}")
+                        id2_state = "ROT90"
+                    else:
+                        ok, pos, err = move_to_position(ph, port, ID2, ID2_START_POS, tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+                        print(f"[ID2] -> HOME  | goal={wrap_0_4095(ID2_START_POS)} | {'OK' if ok else 'WARN'} pos={pos} err={err}")
+                        id2_state = "HOME"
+
+                elif key in (b'q', b'Q'):
+                    print("[QUIT] requested")
+                    break
+
+            # =========================
+            # ID1: 접촉 감지 -> HOLD_CURRENT 전환
+            # =========================
+            if id1_state == "GRIPPING" and (not id1_contacted):
+                cur = abs(read_cur_strict(ph, port, ID1))
+                if cur >= CONTACT_CURRENT_TH:
+                    id1_contact_cnt += 1
+                else:
+                    id1_contact_cnt = 0
+
+                if id1_contact_cnt >= CONTACT_DEBOUNCE_COUNT:
+                    id1_contacted = True
+                    r, e = write2(ph, port, ID1, ADDR_GOAL_CURRENT, HOLD_CURRENT)
+                    safe_check(ph, r, e, f"ID1 set HOLD_CURRENT={HOLD_CURRENT}")
+                    print(f"[ID1] CONTACT -> HOLD_CURRENT={HOLD_CURRENT}")
+
+            # =========================
+            # 상태 출력
+            # =========================
+            now = time.time()
+            if now >= next_print:
+                p1 = read_pos_try(ph, port, ID1, retry=0)
+                p2 = read_pos_try(ph, port, ID2, retry=0)
+
+                cur1 = None
+                if p1 is not None:
+                    try:
+                        cur1 = read_cur_strict(ph, port, ID1)
+                    except:
+                        cur1 = None
+
+                print(f"  ID1: state={id1_state:9s} pos={p1} cur={cur1} contacted={id1_contacted} | "
+                      f"ID2: state={id2_state:5s} pos={p2}")
+                next_print = now + PRINT_DT
+
+            time.sleep(0.01)
+
+    finally:
+        # 안전 종료
+        try:
+            write2(ph, port, ID1, ADDR_GOAL_CURRENT, 0)
+            write1(ph, port, ID1, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+        except:
+            pass
+
+        try:
+            write1(ph, port, ID2, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+        except:
+            pass
+
+        port.closePort()
+        print("\n[END] Torque OFF & close port")
+
+if __name__ == "__main__":
+    main()
