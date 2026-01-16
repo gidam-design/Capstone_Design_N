@@ -1,0 +1,49 @@
+우선 환경설정으로 https://raw.githubusercontent.com/ROBOTIS-GIT/OpenRB-150/master/package_openrb_index.json 보드 추가 후, board manager에서 open RB 150 다운
+
+// OpenRB-150 : Button Test (D1, D2)
+// INPUT_PULLUP + non-blocking debounce + press edge
+
+const int BTN1 = 1;  // D1
+const int BTN2 = 2;  // D2
+
+const unsigned long DEBOUNCE_MS = 30;
+
+int stable1 = HIGH, stable2 = HIGH;     // 확정된(안정) 상태
+int lastRead1 = HIGH, lastRead2 = HIGH; // 직전 읽은 값(바운싱 포함)
+unsigned long t1 = 0, t2 = 0;
+
+void setup() {
+  pinMode(BTN1, INPUT_PULLUP);
+  pinMode(BTN2, INPUT_PULLUP);
+  Serial.begin(115200);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // ===== BTN1 =====
+  int r1 = digitalRead(BTN1);
+  if (r1 != lastRead1) {        // 값이 바뀌면 타이머 리셋
+    lastRead1 = r1;
+    t1 = now;
+  }
+  if ((now - t1) > DEBOUNCE_MS) {  // 충분히 안정되면 stable 갱신
+    if (stable1 != r1) {
+      stable1 = r1;
+      if (stable1 == LOW) Serial.println("BTN1"); // 눌림 확정 1회
+    }
+  }
+
+  // ===== BTN2 =====
+  int r2 = digitalRead(BTN2);
+  if (r2 != lastRead2) {
+    lastRead2 = r2;
+    t2 = now;
+  }
+  if ((now - t2) > DEBOUNCE_MS) {
+    if (stable2 != r2) {
+      stable2 = r2;
+      if (stable2 == LOW) Serial.println("BTN2");
+    }
+  }
+}
