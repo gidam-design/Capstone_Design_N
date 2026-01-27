@@ -1,0 +1,355 @@
+import time
+import math
+from dynamixel_sdk import PortHandler, PacketHandler, COMM_SUCCESS
+
+# =========================
+# 기본 설정(필요하면 수정)
+# =========================
+PORT_NAME = "COM35"
+BAUDRATE = 57600
+PROTOCOL_VERSION = 2.0
+
+ID2 = 2
+ID2_START_POS = 3485
+PLUS_DIR = -1
+DELTA_180 = 2082
+
+POS_TOL = 30
+MOVE_TIMEOUT = 10.0
+VEL_DT_DEFAULT = 0.02  # 20ms
+
+# =========================
+# Control Table (XM430)
+# =========================
+ADDR_TORQUE_ENABLE = 64
+ADDR_OPERATING_MODE = 11
+ADDR_GOAL_POSITION = 116
+ADDR_PRESENT_POSITION = 132
+
+ADDR_PROFILE_ACCELERATION = 108
+ADDR_PROFILE_VELOCITY = 112
+ADDR_PRESENT_VELOCITY = 128
+ADDR_VELOCITY_LIMIT = 44
+
+TORQUE_ENABLE = 1
+TORQUE_DISABLE = 0
+POSITION_MODE = 3
+
+TICKS_PER_REV = 4096
+N_TRIALS = 5   # 기본 반복 측정 횟수
+
+# =========================
+# 유틸
+# =========================
+def wrap_0_4095(x: int) -> int:
+    return int(x) % TICKS_PER_REV
+
+def min_circular_err(pos: int, goal: int) -> int:
+    diff = (pos - goal) % TICKS_PER_REV
+    return min(diff, TICKS_PER_REV - diff)
+
+def to_signed_32(x: int) -> int:
+    if x > 2147483647:
+        x -= 4294967296
+    return x
+
+def velraw_to_rpm(vel_raw_u32: int) -> float:
+    v = to_signed_32(int(vel_raw_u32))
+    return v * 0.229
+
+def rpm_to_raw(rpm: float) -> int:
+    return int(rpm / 0.229)
+
+def rpms_to_radps2(a_rpms: float) -> float:
+    return a_rpms * (2.0 * math.pi / 60.0)
+
+# =========================
+# SDK 반환값 호환 처리
+# =========================
+def write1(ph, port, dxl_id, addr, val) -> bool:
+    res = ph.write1ByteTxRx(port, dxl_id, addr, val)
+    if isinstance(res, (tuple, list)) and len(res) >= 2:
+        r, e = res[-2], res[-1]
+        return (r == COMM_SUCCESS and e == 0)
+    return False
+
+def write4(ph, port, dxl_id, addr, val) -> bool:
+    res = ph.write4ByteTxRx(port, dxl_id, addr, val)
+    if isinstance(res, (tuple, list)) and len(res) >= 2:
+        r, e = res[-2], res[-1]
+        return (r == COMM_SUCCESS and e == 0)
+    return False
+
+def read4(ph, port, dxl_id, addr):
+    res = ph.read4ByteTxRx(port, dxl_id, addr)
+    if isinstance(res, (tuple, list)) and len(res) >= 3:
+        val, r, e = res[0], res[-2], res[-1]
+        if r == COMM_SUCCESS and e == 0:
+            return int(val)
+    return None
+
+# =========================
+# 모드/이동
+# =========================
+def set_position_mode(ph, port, dxl_id) -> bool:
+    if not write1(ph, port, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE):
+        return False
+    time.sleep(0.05)
+    if not write1(ph, port, dxl_id, ADDR_OPERATING_MODE, POSITION_MODE):
+        return False
+    time.sleep(0.05)
+    if not write1(ph, port, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE):
+        return False
+    time.sleep(0.05)
+    return True
+
+def move_to(ph, port, dxl_id, goal_pos, tol=30, timeout=8.0, settle_need=3) -> bool:
+    goal_pos = wrap_0_4095(goal_pos)
+    if not write4(ph, port, dxl_id, ADDR_GOAL_POSITION, goal_pos):
+        return False
+
+    t0 = time.perf_counter()
+    ok_cnt = 0
+
+    while True:
+        pos = read4(ph, port, dxl_id, ADDR_PRESENT_POSITION)
+        if pos is not None:
+            err = min_circular_err(pos, goal_pos)
+            if err <= tol:
+                ok_cnt += 1
+            else:
+                ok_cnt = 0
+            if ok_cnt >= settle_need:
+                return True
+
+        if (time.perf_counter() - t0) > timeout:
+            return False
+
+        time.sleep(0.01)
+
+def print_profile_params(ph, port, dxl_id):
+    acc = read4(ph, port, dxl_id, ADDR_PROFILE_ACCELERATION)
+    vel = read4(ph, port, dxl_id, ADDR_PROFILE_VELOCITY)
+    vlim = read4(ph, port, dxl_id, ADDR_VELOCITY_LIMIT)
+
+    print(f"[ID{dxl_id}] Profile Acc(108) = {acc}")
+    if vel is not None:
+        print(f"[ID{dxl_id}] Profile Vel(112) = {vel}  (~{vel*0.229:.1f} rpm cmd)")
+    else:
+        print(f"[ID{dxl_id}] Profile Vel(112) = {vel}")
+    if vlim is not None:
+        print(f"[ID{dxl_id}] Velocity Limit(44) = {vlim} (~{vlim*0.229:.1f} rpm)")
+    else:
+        print(f"[ID{dxl_id}] Velocity Limit(44) = {vlim}")
+
+def set_profile(ph, port, dxl_id, target_rpm_cmd: float, acc_raw: int):
+    vel_raw = rpm_to_raw(target_rpm_cmd)
+    ok1 = write4(ph, port, dxl_id, ADDR_PROFILE_ACCELERATION, int(acc_raw))
+    ok2 = write4(ph, port, dxl_id, ADDR_PROFILE_VELOCITY, int(vel_raw))
+    print(f"[SET] Acc(108)={acc_raw} -> {'OK' if ok1 else 'FAIL'}")
+    print(f"[SET] Vel(112)={vel_raw} (~{target_rpm_cmd} rpm cmd) -> {'OK' if ok2 else 'FAIL'}")
+    return ok1 and ok2
+
+# =========================
+# 측정: 180도 평균 rpm + 피크 속도 + 피크 가속도
+# =========================
+def measure_180deg_rpm_and_accel(
+    ph, port, dxl_id,
+    start_pos, plus_dir, delta_180,
+    tol=30, timeout=10.0,
+    vel_dt=0.02,
+    settle_need=3
+):
+    start_pos = wrap_0_4095(start_pos)
+    goal = wrap_0_4095(start_pos + plus_dir * delta_180)
+
+    # 시작점
+    if not move_to(ph, port, dxl_id, start_pos, tol=tol, timeout=timeout, settle_need=settle_need):
+        print("[MEAS] Failed to move to START")
+        return None
+    time.sleep(0.2)
+
+    # GO
+    if not write4(ph, port, dxl_id, ADDR_GOAL_POSITION, goal):
+        print("[MEAS] write GOAL failed")
+        return None
+
+    t0 = time.perf_counter()
+    last_t = t0
+
+    vraw0 = read4(ph, port, dxl_id, ADDR_PRESENT_VELOCITY)
+    if vraw0 is None:
+        print("[MEAS] cannot read Present Velocity(128)")
+        return None
+    last_rpm = velraw_to_rpm(vraw0)
+
+    peak_acc_rpms = 0.0
+    peak_speed_rpm = abs(last_rpm)
+
+    ok_cnt = 0
+
+    while True:
+        now = time.perf_counter()
+
+        # 도달 체크
+        pos = read4(ph, port, dxl_id, ADDR_PRESENT_POSITION)
+        if pos is not None:
+            err = min_circular_err(pos, goal)
+            if err <= tol:
+                ok_cnt += 1
+            else:
+                ok_cnt = 0
+
+            if ok_cnt >= settle_need:
+                t1 = time.perf_counter()
+                dt_move = t1 - t0
+                avg_rpm = 30.0 / dt_move  # 180deg=0.5rev => rpm=30/dt
+
+                return {
+                    "time_sec": dt_move,
+                    "avg_rpm": avg_rpm,
+                    "peak_speed_rpm": peak_speed_rpm,
+                    "peak_acc_rpm_s": peak_acc_rpms,
+                    "peak_acc_rad_s2": rpms_to_radps2(peak_acc_rpms),
+                    "goal": goal,
+                    "final_pos": pos
+                }
+
+        # 속도 로그
+        if (now - last_t) >= vel_dt:
+            vraw = read4(ph, port, dxl_id, ADDR_PRESENT_VELOCITY)
+            if vraw is not None:
+                rpm = velraw_to_rpm(vraw)
+
+                if abs(rpm) > peak_speed_rpm:
+                    peak_speed_rpm = abs(rpm)
+
+                dt = now - last_t
+                if dt > 1e-6:
+                    a = abs((rpm - last_rpm) / dt)  # rpm/s
+                    if a > peak_acc_rpms:
+                        peak_acc_rpms = a
+
+                last_rpm = rpm
+                last_t = now
+            else:
+                last_t = now
+
+        # 타임아웃
+        if (now - t0) > timeout:
+            dt_move = time.perf_counter() - t0
+            print(f"[MEAS] TIMEOUT after {dt_move:.3f}s (pos={pos}, goal={goal})")
+            return None
+
+        time.sleep(0.005)
+
+# =========================
+# 입력 유틸
+# =========================
+def ask_float(prompt, default=None):
+    s = input(prompt).strip()
+    if s == "" and default is not None:
+        return float(default)
+    return float(s)
+
+def ask_int(prompt, default=None):
+    s = input(prompt).strip()
+    if s == "" and default is not None:
+        return int(default)
+    return int(s)
+
+def main():
+    print("=== ID2 RPM & REAL ACCEL TEST (interactive) ===")
+    print(f"PORT={PORT_NAME}, BAUD={BAUDRATE}, ID={ID2}\n")
+
+    port = PortHandler(PORT_NAME)
+    ph = PacketHandler(PROTOCOL_VERSION)
+
+    if not port.openPort():
+        raise RuntimeError("Port open failed")
+    if not port.setBaudRate(BAUDRATE):
+        raise RuntimeError("Baudrate set failed")
+
+    try:
+        model, r, e = ph.ping(port, ID2)
+        if r != COMM_SUCCESS or e != 0:
+            raise RuntimeError(f"Ping failed ID={ID2} r={r} e={e}")
+        print(f"[OK] Found ID={ID2} model={model}")
+
+        if not set_position_mode(ph, port, ID2):
+            raise RuntimeError("Failed to set POSITION_MODE")
+
+        print("\n[CURRENT PARAMS]")
+        print_profile_params(ph, port, ID2)
+
+        # 입력 받기
+        print("\n[INPUT] Enter to use default values.")
+        do_set = input("Set Profile? (y/N): ").strip().lower() == "y"
+
+        target_rpm = None
+        acc_raw = None
+        if do_set:
+            target_rpm = ask_float("Target RPM command (default 70): ", default=70)
+            acc_raw = ask_int("Acceleration raw acc_raw (default 40): ", default=40)
+            set_profile(ph, port, ID2, target_rpm, acc_raw)
+
+            print("\n[AFTER SET]")
+            print_profile_params(ph, port, ID2)
+
+        trials = ask_int(f"Trials N (default {N_TRIALS}): ", default=N_TRIALS)
+        vel_dt = ask_float(f"Velocity log dt sec (default {VEL_DT_DEFAULT}): ", default=VEL_DT_DEFAULT)
+        timeout = ask_float(f"Move timeout sec (default {MOVE_TIMEOUT}): ", default=MOVE_TIMEOUT)
+
+        results = []
+        for i in range(trials):
+            print(f"\n--- Trial {i+1}/{trials} ---")
+            out = measure_180deg_rpm_and_accel(
+                ph, port, ID2,
+                start_pos=ID2_START_POS,
+                plus_dir=PLUS_DIR,
+                delta_180=DELTA_180,
+                tol=POS_TOL,
+                timeout=timeout,
+                vel_dt=vel_dt,
+                settle_need=3
+            )
+            if out is None:
+                print("[TRIAL] measurement failed")
+            else:
+                print(f"[TRIAL] 180deg time = {out['time_sec']:.3f}s")
+                print(f"[TRIAL] avg rpm     = {out['avg_rpm']:.1f}")
+                print(f"[TRIAL] peak speed  = {out['peak_speed_rpm']:.1f} rpm (abs)")
+                print(f"[TRIAL] peak accel  = {out['peak_acc_rpm_s']:.1f} rpm/s "
+                      f"(= {out['peak_acc_rad_s2']:.2f} rad/s^2)")
+                results.append(out)
+
+            # 복귀
+            move_to(ph, port, ID2, ID2_START_POS, tol=POS_TOL, timeout=timeout)
+            time.sleep(0.3)
+
+        if results:
+            avg_rpms = [r["avg_rpm"] for r in results]
+            peak_accs = [r["peak_acc_rpm_s"] for r in results]
+            peak_speeds = [r["peak_speed_rpm"] for r in results]
+
+            print("\n=========================")
+            print(f"[RESULT] trials={len(results)}")
+            print(f"[RESULT] avg rpm     : mean={sum(avg_rpms)/len(avg_rpms):.1f}, "
+                  f"min={min(avg_rpms):.1f}, max={max(avg_rpms):.1f}")
+            print(f"[RESULT] peak speed  : mean={sum(peak_speeds)/len(peak_speeds):.1f}, "
+                  f"min={min(peak_speeds):.1f}, max={max(peak_speeds):.1f} (abs rpm)")
+            print(f"[RESULT] peak accel  : mean={sum(peak_accs)/len(peak_accs):.1f}, "
+                  f"min={min(peak_accs):.1f}, max={max(peak_accs):.1f} (rpm/s)")
+            print("=========================")
+        else:
+            print("\n[RESULT] No valid measurements.")
+
+    finally:
+        try:
+            write1(ph, port, ID2, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+        except:
+            pass
+        port.closePort()
+
+if __name__ == "__main__":
+    main()
