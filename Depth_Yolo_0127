@@ -1,0 +1,220 @@
+import time
+import threading
+import pyrealsense2 as rs
+import numpy as np
+import cv2
+from ultralytics import YOLO
+
+LAST_DET = {
+    "found": False,
+    "cx": None,
+    "cy": None,
+    "dist_cm": None,
+    "conf": None,
+    "bbox": None,   # (x1,y1,x2,y2)
+    "ts": 0.0
+}
+LAST_DET_LOCK = threading.Lock()
+
+
+def run_depth_yolo(
+    stop_event: threading.Event,
+    model_path="C:/Users/LG/Downloads/best.pt",
+    conf_th=0.5,
+    infer_fps=10,
+    show_window=True,
+    window_name="YOLO + Color",
+    depth_window_name="Depth Map",
+    use_center_roi_ratio=0.2,
+    min_valid_pixels=30,
+
+    # Depth map 표시 범위(센티미터)
+    depth_min_cm=10.0,
+    depth_max_cm=80.0,
+
+    # Depth 창에 박스도 같이 그릴지
+    draw_boxes_on_depth=True,
+
+    # 탐지 끊겨도 박스 유지 시간
+    hold_sec=0.35,
+
+    # dist 계산을 mean 대신 median으로 (노이즈 덜 튐)
+    use_median=True,
+):
+
+    model = YOLO(model_path)
+
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+
+    try:
+        profile = pipeline.start(config)
+    except RuntimeError as e:
+        print(f"카메라 연결 오류: {e}")
+        return
+
+    try:
+        depth_sensor = profile.get_device().first_depth_sensor()
+        depth_scale = depth_sensor.get_depth_scale()
+    except Exception:
+        depth_scale = None
+
+    align = rs.align(rs.stream.color)
+
+    infer_dt = (1.0 / infer_fps) if (infer_fps and infer_fps > 0) else 0.0
+    last_infer_t = 0.0
+
+    # ✅ 박스 캐시 + 마지막 탐지 시각(hold용)
+    last_boxes_cache = []
+    last_det_time = 0.0
+
+    try:
+        while not stop_event.is_set():
+            frames = pipeline.wait_for_frames()
+            frames = align.process(frames)
+
+            depth_frame = frames.get_depth_frame()
+            color_frame = frames.get_color_frame()
+            if not depth_frame or not color_frame:
+                continue
+
+            depth_image = np.asanyarray(depth_frame.get_data())  # uint16
+            color_image = np.asanyarray(color_frame.get_data())  # bgr
+
+            # Depth colormap
+            if depth_scale is not None:
+                depth_cm = depth_image.astype(np.float32) * depth_scale * 100.0
+            else:
+                depth_cm = depth_image.astype(np.float32) * 0.01  # fallback
+
+            depth_cm = np.where(depth_image == 0, depth_max_cm, depth_cm)
+            depth_cm = np.clip(depth_cm, depth_min_cm, depth_max_cm)
+
+            depth_norm = ((depth_cm - depth_min_cm) / (depth_max_cm - depth_min_cm) * 255.0).astype(np.uint8)
+            depth_colormap = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
+
+            # 추론 주기 제어
+            now = time.time()
+            do_infer = True
+            if infer_dt > 0:
+                if now - last_infer_t < infer_dt:
+                    do_infer = False
+                else:
+                    last_infer_t = now
+
+            vis_image = color_image.copy()
+
+            if do_infer:
+                results = model(color_image, conf=conf_th, verbose=False)
+
+                best = None
+                boxes_this_frame = []
+
+                for result in results:
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        conf = float(box.conf[0])
+
+                        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                        w, h = (x2 - x1), (y2 - y1)
+
+                        rx = max(1, int(w * use_center_roi_ratio / 2))
+                        ry = max(1, int(h * use_center_roi_ratio / 2))
+
+                        roi_x1 = max(0, cx - rx)
+                        roi_x2 = min(depth_image.shape[1], cx + rx)
+                        roi_y1 = max(0, cy - ry)
+                        roi_y2 = min(depth_image.shape[0], cy + ry)
+
+                        depth_roi = depth_image[roi_y1:roi_y2, roi_x1:roi_x2]
+                        valid = depth_roi[depth_roi > 0]
+
+                        dist_cm_val = 0.0
+                        if valid.size >= min_valid_pixels:
+                            raw = float(np.median(valid)) if use_median else float(np.mean(valid))
+                            if depth_scale is not None:
+                                dist_cm_val = (raw * depth_scale) * 100.0
+                            else:
+                                dist_cm_val = raw * 0.01
+
+                        boxes_this_frame.append((x1, y1, x2, y2, conf, dist_cm_val))
+
+                        if best is None or conf > best[0]:
+                            best = (conf, cx, cy, dist_cm_val, (x1, y1, x2, y2))
+
+                # ✅ 탐지 결과가 있으면 캐시 갱신 + 시간 갱신
+                if boxes_this_frame:
+                    last_boxes_cache = boxes_this_frame
+                    last_det_time = time.time()
+                else:
+                    # ✅ 탐지가 없으면 hold_sec 동안은 캐시 유지
+                    if time.time() - last_det_time > hold_sec:
+                        last_boxes_cache = []
+
+                # LAST_DET 업데이트(최고 conf 1개 기준)
+                with LAST_DET_LOCK:
+                    if best is not None:
+                        conf, cx, cy, dist_cm_val, bbox = best
+                        LAST_DET.update({
+                            "found": True,
+                            "cx": cx,
+                            "cy": cy,
+                            "dist_cm": dist_cm_val,
+                            "conf": conf,
+                            "bbox": bbox,
+                            "ts": time.time()
+                        })
+                    else:
+                        LAST_DET.update({
+                            "found": False,
+                            "cx": None,
+                            "cy": None,
+                            "dist_cm": None,
+                            "conf": None,
+                            "bbox": None,
+                            "ts": time.time()
+                        })
+
+            if last_boxes_cache:
+                for (x1, y1, x2, y2, conf, dist_cm_val) in last_boxes_cache:
+                    label = f"Leg {conf:.2f} | {dist_cm_val:.1f}cm"
+                    cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(vis_image, label, (x1, max(0, y1 - 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            if draw_boxes_on_depth and last_boxes_cache:
+                for (x1, y1, x2, y2, conf, dist_cm_val) in last_boxes_cache:
+                    cv2.rectangle(depth_colormap, (x1, y1), (x2, y2), (255, 255, 255), 2)
+                    txt = f"{dist_cm_val:.1f}cm"
+                    cv2.putText(depth_colormap, txt, (x1, min(depth_colormap.shape[0]-5, y2 + 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+            # =========================
+            # 창 출력
+            # =========================
+            if show_window:
+                cv2.imshow(window_name, vis_image)
+                cv2.imshow(depth_window_name, depth_colormap)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    stop_event.set()
+                    break
+
+    finally:
+        try:
+            pipeline.stop()
+        except:
+            pass
+        try:
+            if show_window:
+                cv2.destroyAllWindows()
+        except:
+            pass
+
+
+def get_last_detection():
+    with LAST_DET_LOCK:
+        return dict(LAST_DET)
