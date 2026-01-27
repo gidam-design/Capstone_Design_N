@@ -1,0 +1,618 @@
+import time
+import msvcrt
+import serial
+import threading
+import statistics
+import cv2
+
+from dynamixel_sdk import PortHandler, PacketHandler, COMM_SUCCESS
+from depth_yolo import run_depth_yolo
+
+BTN_PORT = "COM36"
+BTN_BAUD = 115200
+BTN_TIMEOUT = 0.05   # 너무 짧으면 누락/빈 줄 증가
+
+PORT_NAME = "COM35"
+BAUDRATE = 57600
+PROTOCOL_VERSION = 2.0
+
+ID1 = 1   # 그리퍼
+ID2 = 2   # 회전
+
+ADDR_TORQUE_ENABLE      = 64
+ADDR_OPERATING_MODE     = 11
+ADDR_GOAL_POSITION      = 116
+ADDR_PRESENT_POSITION   = 132
+ADDR_GOAL_CURRENT       = 102
+ADDR_PRESENT_CURRENT    = 126
+
+TORQUE_ENABLE  = 1
+TORQUE_DISABLE = 0
+
+POSITION_MODE = 3
+CURRENT_MODE  = 0
+
+TICKS_PER_REV = 4096
+
+# =========================
+# ID1 (그리퍼)
+# =========================
+ID1_START_POS = 2900
+CLOSE_CURRENT = 140
+CONTACT_CURRENT_TH = 110
+HOLD_CURRENT = 100
+CONTACT_DEBOUNCE_COUNT = 4
+ID1_MOVE_TIMEOUT_SEC = 3.0
+ID1_POS_TOL = 30
+
+# =========================
+# ID2 (회전)
+# =========================
+ID2_START_POS = 3485
+PLUS_DIR = -1
+DELTA_180 = 2082
+DELTA_90  = 1041
+ID2_MOVE_TIMEOUT_SEC = 4.0
+ID2_POS_TOL = 30
+
+# =========================
+# 출력/부하 제어
+# =========================
+PRINT_DT = 1.2
+
+# =========================
+# 공통 유틸
+# =========================
+def wrap_0_4095(x) -> int:
+    return int(x) % TICKS_PER_REV
+
+def to_signed_16(x: int) -> int:
+    return x - 65536 if x > 32767 else x
+
+# =========================
+# Dynamixel 안전 호출(락 + 예외 차단)
+# =========================
+DXL_LOCK = threading.Lock()
+
+def safe_dxl_call(port, func, *args, **kwargs):
+    with DXL_LOCK:
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            try:
+                if hasattr(port, "clearPort"):
+                    port.clearPort()
+            except:
+                pass
+            return None
+
+def _extract_re(res):
+    if res is None or (not isinstance(res, (tuple, list))) or len(res) < 2:
+        return None, None
+    return res[-2], res[-1]
+
+# =========================
+# Read / Write (모두 safe_dxl_call 사용)
+# =========================
+def read_pos_try(ph, port, dxl_id, retry=3):
+    for _ in range(retry):
+        res = safe_dxl_call(port, ph.read4ByteTxRx, port, dxl_id, ADDR_PRESENT_POSITION)
+        if isinstance(res, (tuple, list)) and len(res) == 3:
+            pos, r, e = res
+            if r == COMM_SUCCESS and e == 0:
+                pos = int(pos)
+                if 0 <= pos < 4096:
+                    return pos
+        time.sleep(0.005)
+    return None
+
+def read_cur_try(ph, port, dxl_id, retry=3):
+    for _ in range(retry):
+        res = safe_dxl_call(port, ph.read2ByteTxRx, port, dxl_id, ADDR_PRESENT_CURRENT)
+        if isinstance(res, (tuple, list)) and len(res) == 3:
+            cur, r, e = res
+            if r == COMM_SUCCESS and e == 0:
+                return to_signed_16(int(cur))
+        time.sleep(0.005)
+    return None
+
+def write1_try(ph, port, dxl_id, addr, val, retry=10, sleep=0.01):
+    for _ in range(retry):
+        res = safe_dxl_call(port, ph.write1ByteTxRx, port, dxl_id, addr, val)
+        r, e = _extract_re(res)
+        if r == COMM_SUCCESS and e == 0:
+            return True
+        time.sleep(sleep)
+    return False
+
+def write2_try(ph, port, dxl_id, addr, val, retry=10, sleep=0.01):
+    for _ in range(retry):
+        res = safe_dxl_call(port, ph.write2ByteTxRx, port, dxl_id, addr, val)
+        r, e = _extract_re(res)
+        if r == COMM_SUCCESS and e == 0:
+            return True
+        time.sleep(sleep)
+    return False
+
+def write4_try(ph, port, dxl_id, addr, val, retry=10, sleep=0.01):
+    for _ in range(retry):
+        res = safe_dxl_call(port, ph.write4ByteTxRx, port, dxl_id, addr, val)
+        r, e = _extract_re(res)
+        if r == COMM_SUCCESS and e == 0:
+            return True
+        time.sleep(sleep)
+    return False
+
+# =========================
+# 모드/이동 제어
+# =========================
+def set_mode_id1_safe(ph, port, mode):
+    if not write1_try(ph, port, ID1, ADDR_TORQUE_ENABLE, TORQUE_DISABLE, retry=10):
+        return False
+    time.sleep(0.02)
+
+    if not write1_try(ph, port, ID1, ADDR_OPERATING_MODE, mode, retry=10):
+        return False
+    time.sleep(0.02)
+
+    if not write1_try(ph, port, ID1, ADDR_TORQUE_ENABLE, TORQUE_ENABLE, retry=10):
+        return False
+    time.sleep(0.02)
+    return True
+
+def init_id2_position_mode(ph, port):
+    if not write1_try(ph, port, ID2, ADDR_TORQUE_ENABLE, TORQUE_DISABLE, retry=10):
+        return False
+    time.sleep(0.02)
+
+    if not write1_try(ph, port, ID2, ADDR_OPERATING_MODE, POSITION_MODE, retry=10):
+        return False
+    time.sleep(0.02)
+
+    if not write1_try(ph, port, ID2, ADDR_TORQUE_ENABLE, TORQUE_ENABLE, retry=10):
+        return False
+    time.sleep(0.02)
+    return True
+
+def move_to_position_safe(ph, port, dxl_id, goal_pos, tol=30, timeout=3.0, wrap_goal=False):
+    if wrap_goal:
+        goal_pos = wrap_0_4095(goal_pos)
+
+    if not write4_try(ph, port, dxl_id, ADDR_GOAL_POSITION, int(goal_pos), retry=10):
+        return False, None, None
+
+    t0 = time.time()
+    while True:
+        pos = read_pos_try(ph, port, dxl_id, retry=2)
+        if pos is None:
+            if time.time() - t0 > timeout:
+                return False, None, None
+            time.sleep(0.02)
+            continue
+
+        err = abs(pos - goal_pos)
+        if err <= tol:
+            return True, pos, err
+        if time.time() - t0 > timeout:
+            return False, pos, err
+        time.sleep(0.04)
+
+# =========================
+# 모터 스레드
+# =========================
+def motor_loop(port, ph, btn_ser, stop_event):
+    id1_state = "RELEASED"   # RELEASED / GRIPPING
+    id1_contacted = False
+    id1_contact_cnt = 0
+
+    id2_state = "HOME"       # HOME / ROT180 / ROT90
+    next_print = time.time()
+
+    id2_moving = False
+    id1_busy = False
+    id1_mode = POSITION_MODE
+
+    def ensure_id1_mode(target_mode):
+        nonlocal id1_mode
+        if id1_mode == target_mode:
+            return True
+        ok = set_mode_id1_safe(ph, port, target_mode)
+        if ok:
+            id1_mode = target_mode
+        return ok
+
+    def grip_on():
+        nonlocal id1_state, id1_contacted, id1_contact_cnt, id1_busy
+        if id1_busy or id1_state != "RELEASED":
+            return
+
+        id1_busy = True
+        try:
+            if not ensure_id1_mode(CURRENT_MODE):
+                print("[WARN] ID1 set_mode CURRENT failed")
+                return
+
+            if not write2_try(ph, port, ID1, ADDR_GOAL_CURRENT, CLOSE_CURRENT, retry=12):
+                print(f"[WARN] ID1 set CLOSE_CURRENT={CLOSE_CURRENT} failed")
+                return
+
+            id1_state = "GRIPPING"
+            id1_contacted = False
+            id1_contact_cnt = 0
+            print(f"[ID1] -> GRIP ON | close current={CLOSE_CURRENT}")
+        finally:
+            id1_busy = False
+
+    def grip_release():
+        nonlocal id1_state, id1_contacted, id1_contact_cnt, id1_busy
+        if id1_busy or id1_state != "GRIPPING":
+            return
+
+        id1_busy = True
+        try:
+            if not ensure_id1_mode(CURRENT_MODE):
+                print("[WARN] ID1 set_mode CURRENT failed (release)")
+                return
+
+            if not write2_try(ph, port, ID1, ADDR_GOAL_CURRENT, 0, retry=12):
+                print("[WARN] ID1 goal current=0 failed")
+                return
+
+            print("[ID1] -> RELEASE | goal current=0")
+            id1_contacted = False
+            id1_contact_cnt = 0
+            time.sleep(0.05)
+
+            if not ensure_id1_mode(POSITION_MODE):
+                print("[WARN] ID1 set_mode POSITION failed (return)")
+                return
+            time.sleep(0.05)
+
+            ok, pos, err = move_to_position_safe(
+                ph, port, ID1, ID1_START_POS,
+                tol=ID1_POS_TOL, timeout=ID1_MOVE_TIMEOUT_SEC
+            )
+            print(f"[ID1] RETURN {'OK' if ok else 'WARN'} pos={pos} err={err}")
+            id1_state = "RELEASED"
+        finally:
+            id1_busy = False
+
+    def id2_go_home():
+        nonlocal id2_state, id2_moving
+        if id2_moving:
+            return
+        id2_moving = True
+        try:
+            ok, pos, err = move_to_position_safe(
+                ph, port, ID2, ID2_START_POS,
+                tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True
+            )
+            print(f"[ID2] -> HOME | {'OK' if ok else 'WARN'} pos={pos} err={err}")
+            if ok:
+                id2_state = "HOME"
+        finally:
+            id2_moving = False
+
+    def id2_go_rot180():
+        nonlocal id2_state, id2_moving
+        if id2_moving:
+            return
+        id2_moving = True
+        try:
+            goal = ID2_START_POS + PLUS_DIR * DELTA_180
+            ok, pos, err = move_to_position_safe(
+                ph, port, ID2, goal,
+                tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True
+            )
+            print(f"[ID2] -> ROT180 | {'OK' if ok else 'WARN'} pos={pos} err={err}")
+            if ok:
+                id2_state = "ROT180"
+        finally:
+            id2_moving = False
+
+    def id2_go_rot90():
+        nonlocal id2_state, id2_moving
+        if id2_moving:
+            return
+        id2_moving = True
+        try:
+            goal = ID2_START_POS + PLUS_DIR * DELTA_90
+            ok, pos, err = move_to_position_safe(
+                ph, port, ID2, goal,
+                tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True
+            )
+            print(f"[ID2] -> ROT90 | {'OK' if ok else 'WARN'} pos={pos} err={err}")
+            if ok:
+                id2_state = "ROT90"
+        finally:
+            id2_moving = False
+
+    # =========================
+    # ✅ 숫자키 1/2로 시간 측정 (각 5회 평균)
+    # =========================
+    def measure_id2_move_time(trials=5, mode="ROT180"):
+        """
+        mode: "ROT180" or "ROT90"
+        trial마다:
+          HOME으로 이동(조건 통일) -> 목표각 이동(시간 측정) -> HOME 복귀
+        """
+        nonlocal id2_moving, id2_state
+        if id2_moving:
+            print("[MEASURE] ID2 busy, cannot measure now")
+            return
+
+        id2_moving = True
+        try:
+            times = []
+
+            for i in range(1, trials + 1):
+                # 1) HOME으로 맞추기
+                ok_home, pos_home, err_home = move_to_position_safe(
+                    ph, port, ID2, ID2_START_POS,
+                    tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True
+                )
+                if not ok_home:
+                    print(f"[MEASURE] Trial {i}: HOME failed pos={pos_home} err={err_home}")
+                    continue
+                id2_state = "HOME"
+                time.sleep(0.15)  # 안정화(필요시 0.1~0.3)
+
+                # 2) 목표각
+                if mode == "ROT180":
+                    goal = ID2_START_POS + PLUS_DIR * DELTA_180
+                elif mode == "ROT90":
+                    goal = ID2_START_POS + PLUS_DIR * DELTA_90
+                else:
+                    print("[MEASURE] invalid mode")
+                    return
+
+                # 3) 목표각 이동 시간 측정
+                t0 = time.perf_counter()
+                ok, pos, err = move_to_position_safe(
+                    ph, port, ID2, goal,
+                    tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True
+                )
+                t1 = time.perf_counter()
+
+                if ok:
+                    dt = t1 - t0
+                    times.append(dt)
+                    id2_state = mode
+                    print(f"[MEASURE] Trial {i}/{trials} {mode}: {dt:.4f} s (pos={pos}, err={err})")
+                else:
+                    print(f"[MEASURE] Trial {i}/{trials} {mode}: FAIL (pos={pos}, err={err})")
+
+                # 4) HOME 복귀
+                ok_home2, pos_home2, err_home2 = move_to_position_safe(
+                    ph, port, ID2, ID2_START_POS,
+                    tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True
+                )
+                if ok_home2:
+                    id2_state = "HOME"
+                time.sleep(0.15)
+
+            # 5) 결과 출력
+            if len(times) == 0:
+                print(f"[MEASURE] {mode}: no successful trials")
+                return
+
+            avg = sum(times) / len(times)
+            std = statistics.pstdev(times) if len(times) >= 2 else 0.0
+
+            print(f"\n[RESULT] {mode} move time: n={len(times)}")
+            print(f"  times(s) = {[round(x,4) for x in times]}")
+            print(f"  avg = {avg:.4f} s")
+            print(f"  std = {std:.4f} s\n")
+
+        finally:
+            id2_moving = False
+
+    while not stop_event.is_set():
+        try:
+            line = ""
+            try:
+                line = btn_ser.readline().decode(errors="ignore").strip()
+            except:
+                line = ""
+
+            # 버튼 이벤트
+            if line == "BTN1":
+                if id1_state == "RELEASED":
+                    grip_on()
+                else:
+                    grip_release()
+
+            elif line == "BTN2":
+                if id2_state == "ROT180":
+                    id2_go_home()
+                else:
+                    id2_go_rot180()
+
+            elif line == "BTN3":
+                if id2_state == "ROT90":
+                    id2_go_home()
+                else:
+                    id2_go_rot90()
+
+            # ✅ 키보드 입력
+            if msvcrt.kbhit():
+                k = msvcrt.getch()
+
+                if k in (b"q", b"Q"):
+                    stop_event.set()
+
+                # ✅ 숫자키 1: 180도 이동 시간 5회 평균
+                elif k == b"1":
+                    print("\n[MEASURE START] ID2 ROT180 x5 (HOME->ROT180 time)\n")
+                    measure_id2_move_time(trials=5, mode="ROT180")
+
+                # ✅ 숫자키 2: 90도 이동 시간 5회 평균
+                elif k == b"2":
+                    print("\n[MEASURE START] ID2 ROT90 x5 (HOME->ROT90 time)\n")
+                    measure_id2_move_time(trials=5, mode="ROT90")
+
+            # 접촉 감지
+            if id1_state == "GRIPPING" and (not id1_contacted):
+                cur_val = read_cur_try(ph, port, ID1, retry=2)
+                if cur_val is not None:
+                    cur = abs(cur_val)
+                    if cur >= CONTACT_CURRENT_TH:
+                        id1_contact_cnt += 1
+                    else:
+                        id1_contact_cnt = 0
+
+                    if id1_contact_cnt >= CONTACT_DEBOUNCE_COUNT:
+                        id1_contacted = True
+                        ok = write2_try(ph, port, ID1, ADDR_GOAL_CURRENT, HOLD_CURRENT, retry=12)
+                        if ok:
+                            print(f"[ID1] CONTACT -> HOLD_CURRENT={HOLD_CURRENT}")
+
+            # 상태 출력
+            if time.time() >= next_print:
+                p1 = read_pos_try(ph, port, ID1, retry=1)
+                p2 = read_pos_try(ph, port, ID2, retry=1)
+                print(f"  ID1: state={id1_state:9s} pos={p1} contacted={id1_contacted} | ID2: state={id2_state:5s} pos={p2}")
+                next_print = time.time() + PRINT_DT
+
+            time.sleep(0.01)
+
+        except Exception as ex:
+            msg = str(ex)
+            print("[MOTOR THREAD ERROR]", msg)
+
+            if ("There is no status packet" in msg) or ("Incorrect status packet" in msg):
+                time.sleep(0.2)
+            else:
+                time.sleep(0.05)
+            continue
+
+# =========================
+# 메인
+# =========================
+def main():
+    port = None
+    ph = None
+    btn_ser = None
+    stop_event = threading.Event()
+    motor_thread = None
+    yolo_thread = None
+
+    try:
+        # 1) Dynamixel 포트/패킷 초기화
+        port = PortHandler(PORT_NAME)
+        ph = PacketHandler(PROTOCOL_VERSION)
+
+        if not port.openPort():
+            raise RuntimeError("Port open failed")
+        if not port.setBaudRate(BAUDRATE):
+            raise RuntimeError("Baudrate set failed")
+
+        # ping (초기만 엄격 체크)
+        for dxl_id in (ID1, ID2):
+            model, r, e = ph.ping(port, dxl_id)
+            if r != COMM_SUCCESS or e != 0:
+                raise RuntimeError(f"Ping failed ID={dxl_id} r={r} e={e}")
+            print(f"[OK] Found ID={dxl_id} model={model}")
+
+        # 2) 버튼 시리얼 초기화
+        btn_ser = serial.Serial(BTN_PORT, BTN_BAUD, timeout=BTN_TIMEOUT)
+        time.sleep(0.2)
+        btn_ser.reset_input_buffer()
+        print(f"[OK] Button serial open: {BTN_PORT} @ {BTN_BAUD}")
+
+        # 3) 모터 초기 세팅
+        set_mode_id1_safe(ph, port, POSITION_MODE)
+        move_to_position_safe(ph, port, ID1, ID1_START_POS,
+                              tol=ID1_POS_TOL, timeout=ID1_MOVE_TIMEOUT_SEC)
+
+        ADDR_PROFILE_ACCELERATION = 108
+        ADDR_PROFILE_VELOCITY     = 112
+
+        def rpm_to_raw(rpm: float) -> int:
+            return int(rpm / 0.229)
+
+        if not init_id2_position_mode(ph, port):
+            print("[WARN] ID2 init set_mode POSITION failed")
+
+        move_to_position_safe(ph, port, ID2, ID2_START_POS,
+                              tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+
+        target_rpm = 77
+        vel_raw = rpm_to_raw(target_rpm)
+        acc_raw = 100
+        write4_try(ph, port, ID2, ADDR_PROFILE_ACCELERATION, acc_raw)
+        write4_try(ph, port, ID2, ADDR_PROFILE_VELOCITY, vel_raw)
+
+        print(f"[ID2] Profile set: accel={acc_raw}, vel_raw={vel_raw} (~{target_rpm} rpm)")
+
+        # 그 다음에 위치 이동(안정)
+        move_to_position_safe(ph, port, ID2, ID2_START_POS,
+                              tol=ID2_POS_TOL, timeout=ID2_MOVE_TIMEOUT_SEC, wrap_goal=True)
+
+        print("\n[READY]")
+        print("  BTN1 : ID1 GRIP <-> RELEASE+RETURN")
+        print("  BTN2 : ID2 HOME <-> ROT180")
+        print("  BTN3 : ID2 HOME <-> ROT90")
+        print("  '1'  : ✅ ID2 180도 이동시간 5회 평균 (HOME->ROT180)")
+        print("  '2'  : ✅ ID2 90도  이동시간 5회 평균 (HOME->ROT90)")
+        print("  'q'  : quit\n")
+
+        # 4) 모터 스레드 시작
+        motor_thread = threading.Thread(
+            target=motor_loop,
+            args=(port, ph, btn_ser, stop_event),
+            daemon=True
+        )
+        motor_thread.start()
+        print("[OK] Motor thread started")
+
+        # 5) YOLO 스레드 시작
+        yolo_thread = threading.Thread(
+            target=run_depth_yolo,
+            args=(stop_event,),
+            daemon=True
+        )
+        yolo_thread.start()
+        print("[OK] YOLO thread started")
+
+        # 6) 메인 루프
+        while not stop_event.is_set():
+            time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        print("종료 중... (Ctrl+C)")
+        stop_event.set()
+
+    finally:
+        stop_event.set()
+
+        # 버튼 시리얼 닫기
+        try:
+            if btn_ser and btn_ser.is_open:
+                btn_ser.close()
+        except:
+            pass
+
+        # 토크 OFF
+        try:
+            if ph and port:
+                write1_try(ph, port, ID1, ADDR_TORQUE_ENABLE, TORQUE_DISABLE, retry=3)
+                write1_try(ph, port, ID2, ADDR_TORQUE_ENABLE, TORQUE_DISABLE, retry=3)
+        except:
+            pass
+
+        # 포트 닫기
+        try:
+            if port:
+                port.closePort()
+        except:
+            pass
+
+        # OpenCV 창 정리
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()
